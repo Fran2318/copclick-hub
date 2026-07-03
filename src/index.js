@@ -13,6 +13,10 @@ import {
   storeOrders,
   storeProducts,
   storeDashboard,
+  getOrder,
+  setOrderStatus,
+  deleteOrder,
+  reprintOrder,
   verifySession
 } from './store.js'
 
@@ -150,6 +154,16 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/store/dashboard') return json(res, 200, await storeDashboard(session))
     if (url.pathname === '/store/orders') return json(res, 200, await storeOrders(session))
     if (url.pathname === '/store/products') return json(res, 200, await storeProducts(session))
+
+    let sm = url.pathname.match(/^\/store\/orders\/([^/]+)$/)
+    if (sm && req.method === 'GET') return json(res, 200, await getOrder(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/orders\/([^/]+)\/status$/)
+    if (sm && req.method === 'POST') return json(res, 200, await setOrderStatus(session, sm[1], body.status))
+    sm = url.pathname.match(/^\/store\/orders\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteOrder(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/orders\/([^/]+)\/reprint$/)
+    if (sm && req.method === 'POST') return json(res, 200, await reprintOrder(session, sm[1]))
+
     return json(res, 404, { error: 'not found' })
   }
 
