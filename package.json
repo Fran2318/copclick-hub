@@ -1,0 +1,16 @@
+{
+  "name": "copclick-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "COPCLICK Hub — servidor WS multi-tenant de impresión + ingesta por Realtime",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node src/index.js",
+    "create-client": "node src/create-client.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.110.0",
+    "ws": "^8.18.0"
+  }
+}
