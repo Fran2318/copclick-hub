@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "COPCLICK Hub — servidor WS multi-tenant de impresión + ingesta por Realtime",
-  "engines": { "node": ">=18" },
+  "engines": { "node": "22.x" },
   "scripts": {
     "start": "node src/index.js",
     "create-client": "node src/create-client.js"
