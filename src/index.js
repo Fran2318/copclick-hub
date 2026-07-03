@@ -4,6 +4,17 @@ import { CONFIG } from './config.js'
 import { eco } from './supabase.js'
 import { attachHub, connectedCounts, blockClient, unblockClient } from './hub.js'
 import { startIngest, reloadIngest } from './ingest.js'
+import {
+  activate,
+  setupAdmin,
+  login,
+  listUsers,
+  createUser,
+  storeOrders,
+  storeProducts,
+  storeDashboard,
+  verifySession
+} from './store.js'
 
 function json(res, code, obj) {
   res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
@@ -32,7 +43,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'content-type, x-admin-key',
+      'access-control-allow-headers': 'content-type, x-admin-key, authorization',
       'access-control-allow-methods': 'GET, POST, OPTIONS'
     })
     return res.end()
@@ -107,6 +118,38 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true })
     }
 
+    return json(res, 404, { error: 'not found' })
+  }
+
+  // ---------- Lado CLIENTE (tienda): login por código + usuarios + datos ----------
+  if (url.pathname.startsWith('/store/')) {
+    const body = req.method === 'POST' ? await readBody(req) : {}
+
+    // Públicas (sin sesión)
+    if (url.pathname === '/store/activate' && req.method === 'POST') {
+      return json(res, 200, await activate(body.code))
+    }
+    if (url.pathname === '/store/setup-admin' && req.method === 'POST') {
+      const r = await setupAdmin(body.code, body.name, body.password)
+      return json(res, r.error ? 400 : 200, r)
+    }
+    if (url.pathname === '/store/login' && req.method === 'POST') {
+      const r = await login(body.code, body.name, body.password)
+      return json(res, r.error ? 401 : 200, r)
+    }
+
+    // Con sesión (Bearer token)
+    const session = verifySession((req.headers['authorization'] || '').replace(/^Bearer /, ''))
+    if (!session) return json(res, 401, { error: 'no autorizado' })
+
+    if (url.pathname === '/store/users' && req.method === 'GET') return json(res, 200, await listUsers(session))
+    if (url.pathname === '/store/users' && req.method === 'POST') {
+      const r = await createUser(session, body.name, body.password, body.role)
+      return json(res, r.error ? 400 : 200, r)
+    }
+    if (url.pathname === '/store/dashboard') return json(res, 200, await storeDashboard(session))
+    if (url.pathname === '/store/orders') return json(res, 200, await storeOrders(session))
+    if (url.pathname === '/store/products') return json(res, 200, await storeProducts(session))
     return json(res, 404, { error: 'not found' })
   }
 

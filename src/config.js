@@ -15,7 +15,10 @@ export const CONFIG = {
   port: Number(process.env.PORT || 8080),
   ecosystemUrl: process.env.ECOSYSTEM_SUPABASE_URL,
   ecosystemServiceKey: process.env.ECOSYSTEM_SERVICE_KEY,
-  adminKey: process.env.ADMIN_KEY || ''
+  adminKey: process.env.ADMIN_KEY || '',
+  // Secreto para firmar las sesiones de los usuarios de tienda.
+  // Si no se define, usamos la service_role (estable) como secreto.
+  sessionSecret: process.env.SESSION_SECRET || process.env.ECOSYSTEM_SERVICE_KEY || 'copclick-dev-secret'
 }
 
 if (!CONFIG.ecosystemUrl || !CONFIG.ecosystemServiceKey) {
