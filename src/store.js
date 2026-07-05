@@ -118,14 +118,23 @@ export async function createUser(session, name, password, role) {
 }
 
 // ---------- Datos de la tienda (proxy al Supabase de la tienda) ----------
+// Cache de clientes por tienda: evita buscar credenciales (y crear un cliente
+// nuevo de supabase-js) en cada request. TTL de 5 min por si se rotan claves.
+const DB_TTL = 5 * 60 * 1000
+const dbCache = new Map() // client_id -> { db, at }
+
 async function storeDbFor(clientId) {
+  const hit = dbCache.get(clientId)
+  if (hit && Date.now() - hit.at < DB_TTL) return hit.db
   const { data: c } = await eco
     .from('print_clients')
     .select('store_supabase_url,store_service_key')
     .eq('id', clientId)
     .single()
   if (!c?.store_supabase_url || !c?.store_service_key) return null
-  return storeClient(c.store_supabase_url, c.store_service_key)
+  const db = storeClient(c.store_supabase_url, c.store_service_key)
+  dbCache.set(clientId, { db, at: Date.now() })
+  return db
 }
 
 export async function storeOrders(session) {
