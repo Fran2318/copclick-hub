@@ -30,6 +30,10 @@ import {
   adjustBranchStock,
   listTransfers,
   transferStock,
+  getFinance,
+  saveFinance,
+  importProducts,
+  listImports,
   verifySession
 } from './store.js'
 import { addStoreListener, removeStoreListener } from './events.js'
@@ -218,6 +222,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/store/branch-stock' && req.method === 'POST') return json(res, 200, await adjustBranchStock(session, body))
     if (url.pathname === '/store/transfers' && req.method === 'GET') return json(res, 200, await listTransfers(session))
     if (url.pathname === '/store/transfers' && req.method === 'POST') return json(res, 200, await transferStock(session, body))
+
+    // Finanzas (indicadores + datos persistentes)
+    if (url.pathname === '/store/finance' && req.method === 'GET') return json(res, 200, await getFinance(session))
+    if (url.pathname === '/store/finance' && req.method === 'POST') return json(res, 200, await saveFinance(session, body))
+
+    // Importación de base de datos
+    if (url.pathname === '/store/import' && req.method === 'POST') return json(res, 200, await importProducts(session, body))
+    if (url.pathname === '/store/imports' && req.method === 'GET') return json(res, 200, await listImports(session))
 
     return json(res, 404, { error: 'not found' })
   }

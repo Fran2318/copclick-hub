@@ -411,6 +411,231 @@ export async function transferStock(session, body) {
   return { ok: true }
 }
 
+// ---------- Finanzas: datos del usuario (persistentes) + indicadores ----------
+const laPazMonth = (d) =>
+  new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/La_Paz' }).slice(0, 7)
+
+// TIR mensual por bisección, anualizada. flows[0] suele ser negativo (inversión).
+function irrAnual(flows) {
+  if (flows.length < 2) return null
+  const npv = (r) => flows.reduce((a, f, i) => a + f / Math.pow(1 + r, i), 0)
+  let lo = -0.95, hi = 5
+  if (npv(lo) * npv(hi) > 0) return null
+  for (let i = 0; i < 120; i++) {
+    const mid = (lo + hi) / 2
+    if (npv(lo) * npv(mid) <= 0) hi = mid
+    else lo = mid
+  }
+  const rm = (lo + hi) / 2
+  return Math.pow(1 + rm, 12) - 1
+}
+
+export async function saveFinance(session, data) {
+  const { error } = await eco.from('store_finance').upsert(
+    {
+      client_id: session.client_id,
+      data: data || {},
+      updated_at: new Date().toISOString(),
+      updated_by: session.name
+    },
+    { onConflict: 'client_id' }
+  )
+  if (error) return { error: error.message }
+  logActivity(session, 'finanzas_actualizadas', 'datos de indicadores')
+  return getFinance(session)
+}
+
+export async function getFinance(session) {
+  const { data: row } = await eco
+    .from('store_finance')
+    .select('data,updated_at,updated_by')
+    .eq('client_id', session.client_id)
+    .maybeSingle()
+  const inputs = row?.data ?? {}
+
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { inputs, meta: row ?? null, indicators: null }
+
+  // Últimos 12 meses de pedidos válidos (excluye cancelados)
+  const desde = new Date()
+  desde.setMonth(desde.getMonth() - 12)
+  const { data: orders } = await db
+    .from('orders')
+    .select('id,total,status,created_at')
+    .gte('created_at', desde.toISOString())
+    .neq('status', 'cancelled')
+
+  // Ítems de esos pedidos (en lotes) + costos del catálogo
+  const ids = (orders ?? []).map((o) => o.id)
+  const items = []
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data: chunk } = await db
+      .from('order_items')
+      .select('order_id,product_id,quantity')
+      .in('order_id', ids.slice(i, i + 100))
+    items.push(...(chunk ?? []))
+  }
+  const { data: prods } = await db.from('products').select('id,wholesale_price')
+  const costMap = new Map((prods ?? []).map((p) => [String(p.id), Number(p.wholesale_price || 0)]))
+  const orderMonth = new Map((orders ?? []).map((o) => [o.id, laPazMonth(o.created_at)]))
+
+  // Buckets mensuales: ingresos, COGS (costo de lo vendido), cobertura de costos
+  const meses = new Map() // 'YYYY-MM' -> { ingresos, cogs }
+  let qtyTotal = 0, qtyConCosto = 0
+  for (const o of orders ?? []) {
+    const m = laPazMonth(o.created_at)
+    if (!meses.has(m)) meses.set(m, { ingresos: 0, cogs: 0 })
+    meses.get(m).ingresos += Number(o.total || 0)
+  }
+  for (const it of items) {
+    const m = orderMonth.get(it.order_id)
+    if (!m || !meses.has(m)) continue
+    const cost = costMap.get(String(it.product_id)) ?? 0
+    const q = Number(it.quantity || 0)
+    qtyTotal += q
+    if (cost > 0) {
+      qtyConCosto += q
+      meses.get(m).cogs += cost * q
+    }
+  }
+
+  const gastosMes =
+    Number(inputs.alquiler || 0) + Number(inputs.sueldos || 0) + Number(inputs.servicios || 0) +
+    Number(inputs.marketing || 0) + Number(inputs.otros || 0)
+
+  // Serie mensual ordenada (últimos 12)
+  const mesesOrd = [...meses.keys()].sort()
+  const serie = mesesOrd.map((m) => {
+    const b = meses.get(m)
+    const bruto = b.ingresos - b.cogs
+    return { mes: m, ingresos: Math.round(b.ingresos), cogs: Math.round(b.cogs), bruto: Math.round(bruto), ban: Math.round(bruto - gastosMes) }
+  })
+
+  const mesActual = laPazMonth(Date.now())
+  const actual = serie.find((s) => s.mes === mesActual) ?? { ingresos: 0, cogs: 0, bruto: 0, ban: -gastosMes }
+
+  const ingresosTot = serie.reduce((a, s) => a + s.ingresos, 0)
+  const brutoTot = serie.reduce((a, s) => a + s.bruto, 0)
+  const margenBrutoPct = ingresosTot > 0 ? Math.round((brutoTot / ingresosTot) * 100) : null
+  const banTot = serie.reduce((a, s) => a + s.ban, 0)
+  const margenNetoPct = ingresosTot > 0 ? Math.round((banTot / ingresosTot) * 100) : null
+
+  // Punto de equilibrio: ventas necesarias para cubrir gastos con el margen bruto actual
+  const puntoEquilibrio =
+    gastosMes > 0 && margenBrutoPct && margenBrutoPct > 0
+      ? Math.round(gastosMes / (margenBrutoPct / 100))
+      : null
+
+  const nPedidos = (orders ?? []).length
+  const ticketPromedio = nPedidos > 0 ? Math.round(ingresosTot / nPedidos) : null
+
+  // TIR y ROI: requieren inversión inicial + fecha
+  let tir = null, roi = null, mesesDesdeInversion = null
+  const inv = Number(inputs.inversion || 0)
+  if (inv > 0 && inputs.fecha_inversion) {
+    const invMonth = String(inputs.fecha_inversion).slice(0, 7)
+    const flujoMeses = mesesOrd.filter((m) => m >= invMonth)
+    mesesDesdeInversion = flujoMeses.length
+    const flows = [-inv, ...flujoMeses.map((m) => serie.find((s) => s.mes === m)?.ban ?? -gastosMes)]
+    tir = irrAnual(flows)
+    const acumulado = flujoMeses.reduce((a, m) => a + (serie.find((s) => s.mes === m)?.ban ?? 0), 0)
+    roi = Math.round((acumulado / inv) * 100)
+  }
+
+  return {
+    inputs,
+    meta: row ? { updated_at: row.updated_at, updated_by: row.updated_by } : null,
+    indicators: {
+      gastosMes,
+      banMesActual: actual.ban,
+      margenBrutoPct,
+      margenNetoPct,
+      puntoEquilibrio,
+      ticketPromedio,
+      tirAnualPct: tir === null ? null : Math.round(tir * 100),
+      roiPct: roi,
+      mesesDesdeInversion,
+      costCoveragePct: qtyTotal > 0 ? Math.round((qtyConCosto / qtyTotal) * 100) : 0,
+      serie: serie.slice(-6)
+    }
+  }
+}
+
+// ---------- Importación de base de datos (productos desde Excel/CSV) ----------
+export async function importProducts(session, body) {
+  const rows = Array.isArray(body.rows) ? body.rows.slice(0, 2000) : []
+  if (!rows.length) return { error: 'sin filas para importar' }
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+
+  const { data: existing } = await db.from('products').select('id,name,code')
+  const byCode = new Map()
+  const byName = new Map()
+  for (const p of existing ?? []) {
+    if (p.code) byCode.set(String(p.code).trim().toLowerCase(), p.id)
+    if (p.name) byName.set(String(p.name).trim().toLowerCase(), p.id)
+  }
+
+  let created = 0, updated = 0
+  const errors = []
+  const toInsert = []
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    const name = String(r.name || '').trim()
+    if (!name) {
+      errors.push(`Fila ${i + 2}: sin nombre de producto`)
+      continue
+    }
+    const row = {
+      name,
+      price: Number(r.price || 0),
+      stock: Math.max(0, Math.round(Number(r.stock || 0))),
+      wholesale_price: Number(r.cost || 0),
+      category: r.category ? String(r.category).trim() : null,
+      code: r.code ? String(r.code).trim() : null
+    }
+    const id =
+      (row.code && byCode.get(row.code.toLowerCase())) || byName.get(name.toLowerCase()) || null
+    if (id) {
+      const { error } = await db.from('products').update(row).eq('id', id)
+      if (error) errors.push(`Fila ${i + 2} (${name}): ${error.message}`)
+      else updated++
+    } else {
+      toInsert.push({ ...row, is_active: true })
+    }
+  }
+
+  for (let i = 0; i < toInsert.length; i += 100) {
+    const chunk = toInsert.slice(i, i + 100)
+    const { error } = await db.from('products').insert(chunk)
+    if (error) errors.push(`Lote de nuevos: ${error.message}`)
+    else created += chunk.length
+  }
+
+  await eco.from('store_imports').insert({
+    client_id: session.client_id,
+    filename: body.filename || 'archivo',
+    rows_processed: rows.length,
+    rows_succeeded: created + updated,
+    rows_failed: errors.length,
+    errors: errors.slice(0, 50),
+    imported_by: session.name
+  })
+  logActivity(session, 'importacion', `${body.filename || 'archivo'}: ${created} nuevos, ${updated} actualizados, ${errors.length} errores`)
+  return { ok: true, created, updated, failed: errors.length, errors: errors.slice(0, 20) }
+}
+
+export async function listImports(session) {
+  const { data } = await eco
+    .from('store_imports')
+    .select('id,filename,rows_processed,rows_succeeded,rows_failed,imported_by,imported_at')
+    .eq('client_id', session.client_id)
+    .order('imported_at', { ascending: false })
+    .limit(20)
+  return data ?? []
+}
+
 // ---------- Clientes (derivados de los pedidos de la tienda) ----------
 export async function storeCustomers(session) {
   const db = await storeDbFor(session.client_id)
