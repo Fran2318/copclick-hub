@@ -234,7 +234,7 @@ export async function listActivity(session) {
 }
 
 // ---------- Productos (CRUD contra la tienda) ----------
-const PROD_FIELDS = ['name', 'description', 'price', 'stock', 'category', 'code', 'is_active']
+const PROD_FIELDS = ['name', 'description', 'price', 'stock', 'category', 'code', 'is_active', 'wholesale_price']
 
 export async function createProduct(session, body) {
   const db = await storeDbFor(session.client_id)
@@ -283,6 +283,132 @@ export async function adjustStock(session, productId, delta, motivo) {
   if (error) return { error: error.message }
   logActivity(session, 'stock_ajustado', `${cur.name}: ${cur.stock} → ${nuevo}${motivo ? ` (${motivo})` : ''}`)
   return { ok: true, stock: nuevo }
+}
+
+// ---------- Sucursales (viven en el Supabase del ecosistema, por client_id) ----------
+export async function listBranches(session) {
+  const { data } = await eco
+    .from('store_branches')
+    .select('id,name,address,phone,is_active,created_at')
+    .eq('client_id', session.client_id)
+    .order('created_at')
+  return data ?? []
+}
+
+export async function saveBranch(session, body) {
+  if (!body.name) return { error: 'falta el nombre' }
+  const row = { name: body.name, address: body.address || null, phone: body.phone || null }
+  if (body.is_active !== undefined) row.is_active = !!body.is_active
+  if (body.id) {
+    const { error } = await eco
+      .from('store_branches')
+      .update(row)
+      .eq('id', body.id)
+      .eq('client_id', session.client_id)
+    if (error) return { error: error.message }
+    logActivity(session, 'sucursal_editada', body.name)
+    return { ok: true }
+  }
+  const { data, error } = await eco
+    .from('store_branches')
+    .insert({ ...row, client_id: session.client_id })
+    .select('id')
+    .single()
+  if (error) return { error: error.message }
+  logActivity(session, 'sucursal_creada', body.name)
+  return { ok: true, id: data.id }
+}
+
+export async function deleteBranch(session, branchId) {
+  await eco.from('store_branch_stock').delete().eq('branch_id', branchId).eq('client_id', session.client_id)
+  const { error } = await eco
+    .from('store_branches')
+    .delete()
+    .eq('id', branchId)
+    .eq('client_id', session.client_id)
+  if (error) return { error: error.message }
+  logActivity(session, 'sucursal_eliminada', branchId)
+  return { ok: true }
+}
+
+// ---------- Stock físico por sucursal ----------
+export async function getBranchStock(session) {
+  const { data } = await eco
+    .from('store_branch_stock')
+    .select('branch_id,product_id,quantity')
+    .eq('client_id', session.client_id)
+  return data ?? []
+}
+
+export async function adjustBranchStock(session, body) {
+  const { branch_id, product_id, delta, nombre } = body
+  if (!branch_id || !product_id) return { error: 'faltan datos' }
+  const { data: cur } = await eco
+    .from('store_branch_stock')
+    .select('id,quantity')
+    .eq('branch_id', branch_id)
+    .eq('product_id', product_id)
+    .maybeSingle()
+  const prev = cur?.quantity ?? 0
+  const nuevo = Math.max(0, prev + Number(delta || 0))
+  const { error } = await eco.from('store_branch_stock').upsert(
+    {
+      client_id: session.client_id,
+      branch_id,
+      product_id,
+      quantity: nuevo,
+      updated_at: new Date().toISOString(),
+      updated_by: session.name
+    },
+    { onConflict: 'branch_id,product_id' }
+  )
+  if (error) return { error: error.message }
+  logActivity(session, 'stock_fisico', `${nombre || product_id}: ${prev} → ${nuevo}`)
+  return { ok: true, quantity: nuevo }
+}
+
+// ---------- Transferencias entre sucursales ----------
+export async function listTransfers(session) {
+  const { data } = await eco
+    .from('store_transfers')
+    .select('id,product_name,from_branch_id,to_branch_id,quantity,transferred_by,transferred_at')
+    .eq('client_id', session.client_id)
+    .order('transferred_at', { ascending: false })
+    .limit(30)
+  return data ?? []
+}
+
+export async function transferStock(session, body) {
+  const { product_id, nombre, from_branch_id, to_branch_id, quantity } = body
+  const qty = Number(quantity || 0)
+  if (!product_id || !from_branch_id || !to_branch_id || qty <= 0) return { error: 'datos incompletos' }
+  if (from_branch_id === to_branch_id) return { error: 'origen y destino son la misma sucursal' }
+
+  const { data: origen } = await eco
+    .from('store_branch_stock')
+    .select('quantity')
+    .eq('branch_id', from_branch_id)
+    .eq('product_id', product_id)
+    .maybeSingle()
+  const disp = origen?.quantity ?? 0
+  if (qty > disp) return { error: `stock insuficiente en origen (hay ${disp})` }
+
+  const r1 = await adjustBranchStock(session, { branch_id: from_branch_id, product_id, delta: -qty, nombre })
+  if (r1.error) return r1
+  const r2 = await adjustBranchStock(session, { branch_id: to_branch_id, product_id, delta: qty, nombre })
+  if (r2.error) return r2
+
+  await eco.from('store_transfers').insert({
+    client_id: session.client_id,
+    product_id,
+    product_name: nombre || null,
+    from_branch_id,
+    to_branch_id,
+    quantity: qty,
+    transferred_by: session.name
+  })
+  logActivity(session, 'transferencia', `${nombre || product_id} ×${qty}`)
+  return { ok: true }
 }
 
 // ---------- Clientes (derivados de los pedidos de la tienda) ----------
@@ -339,13 +465,14 @@ export async function storeProducts(session) {
   if (!db) return []
   const { data } = await db
     .from('products')
-    .select('id,name,code,price,stock,category,description,is_active')
+    .select('id,name,code,price,stock,category,description,is_active,wholesale_price')
     .order('name')
   return (data ?? []).map((p) => ({
     id: p.id,
     nombre: p.name,
     sku: p.code,
     precio: Number(p.price || 0),
+    costo: Number(p.wholesale_price || 0),
     stock: p.stock,
     categoria: p.category,
     descripcion: p.description,
@@ -361,12 +488,13 @@ export async function storeDashboard(session) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
   const sevenAgo = new Date(); sevenAgo.setDate(sevenAgo.getDate() - 6); sevenAgo.setHours(0, 0, 0, 0)
 
-  const [prodRes, recentRes, weekRes, monthRes, prodCount] = await Promise.all([
-    db.from('products').select('name,stock'),
+  const [prodRes, recentRes, weekRes, monthRes, prodCount, fisicoRes] = await Promise.all([
+    db.from('products').select('name,stock,price,wholesale_price'),
     db.from('orders').select('order_number,customer_name,total,status,created_at').order('created_at', { ascending: false }).limit(6),
     db.from('orders').select('total,created_at').gte('created_at', sevenAgo.toISOString()),
     db.from('orders').select('total,payment_status,created_at').gte('created_at', monthStart),
-    db.from('products').select('id', { count: 'exact', head: true })
+    db.from('products').select('id', { count: 'exact', head: true }),
+    eco.from('store_branch_stock').select('quantity').eq('client_id', session.client_id)
   ])
 
   const stockBajo = (prodRes.data ?? []).filter((p) => (p.stock ?? 0) < 5).map((p) => ({ nombre: p.name, stock: p.stock })).sort((a, b) => a.stock - b.stock).slice(0, 10)
@@ -394,5 +522,35 @@ export async function storeDashboard(session) {
     ventas7.push({ dia: d.slice(5), total: tot.get(d) ?? 0, cantidad: cnt.get(d) ?? 0 })
   }
 
-  return { ventasHoy, pedidosHoy: hoy.length, pedidosMes: mes.length, ingresosMes, pagadoMes, totalProductos: prodCount.count ?? 0, stockBajo, ultimos, ventas7 }
+  // Stock online total (catálogo) + stock físico total (todas las sucursales)
+  const stockOnlineTotal = (prodRes.data ?? []).reduce((a, p) => a + (p.stock ?? 0), 0)
+  const stockFisicoTotal = (fisicoRes.data ?? []).reduce((a, r) => a + (r.quantity ?? 0), 0)
+
+  // Margen promedio del catálogo (solo productos con costo cargado)
+  const conCosto = (prodRes.data ?? []).filter((p) => Number(p.wholesale_price) > 0 && Number(p.price) > 0)
+  const margenPct = conCosto.length
+    ? Math.round(
+        (conCosto.reduce((a, p) => a + (Number(p.price) - Number(p.wholesale_price)) / Number(p.price), 0) /
+          conCosto.length) * 100
+      )
+    : null
+
+  // Proyección próximos 7 días: regresión lineal simple sobre los últimos 7
+  const ys = ventas7.map((v) => v.total)
+  const n = ys.length
+  const xm = (n - 1) / 2
+  const ym = ys.reduce((a, b) => a + b, 0) / n
+  let num = 0, den = 0
+  for (let i = 0; i < n; i++) { num += (i - xm) * (ys[i] - ym); den += (i - xm) ** 2 }
+  const b = den ? num / den : 0
+  const a = ym - b * xm
+  let proyeccion7 = 0
+  for (let i = n; i < n + 7; i++) proyeccion7 += Math.max(0, a + b * i)
+  proyeccion7 = Math.round(proyeccion7)
+
+  return {
+    ventasHoy, pedidosHoy: hoy.length, pedidosMes: mes.length, ingresosMes, pagadoMes,
+    totalProductos: prodCount.count ?? 0, stockBajo, ultimos, ventas7,
+    stockOnlineTotal, stockFisicoTotal, margenPct, proyeccion7
+  }
 }

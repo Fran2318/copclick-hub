@@ -23,6 +23,13 @@ import {
   adjustStock,
   storeCustomers,
   listActivity,
+  listBranches,
+  saveBranch,
+  deleteBranch,
+  getBranchStock,
+  adjustBranchStock,
+  listTransfers,
+  transferStock,
   verifySession
 } from './store.js'
 import { addStoreListener, removeStoreListener } from './events.js'
@@ -201,6 +208,16 @@ const server = http.createServer(async (req, res) => {
     // Clientes + actividad
     if (url.pathname === '/store/customers') return json(res, 200, await storeCustomers(session))
     if (url.pathname === '/store/activity') return json(res, 200, await listActivity(session))
+
+    // Sucursales + stock físico + transferencias
+    if (url.pathname === '/store/branches' && req.method === 'GET') return json(res, 200, await listBranches(session))
+    if (url.pathname === '/store/branches' && req.method === 'POST') return json(res, 200, await saveBranch(session, body))
+    sm = url.pathname.match(/^\/store\/branches\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteBranch(session, sm[1]))
+    if (url.pathname === '/store/branch-stock' && req.method === 'GET') return json(res, 200, await getBranchStock(session))
+    if (url.pathname === '/store/branch-stock' && req.method === 'POST') return json(res, 200, await adjustBranchStock(session, body))
+    if (url.pathname === '/store/transfers' && req.method === 'GET') return json(res, 200, await listTransfers(session))
+    if (url.pathname === '/store/transfers' && req.method === 'POST') return json(res, 200, await transferStock(session, body))
 
     return json(res, 404, { error: 'not found' })
   }
