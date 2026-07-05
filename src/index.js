@@ -32,6 +32,8 @@ import {
   transferStock,
   getFinance,
   saveFinance,
+  createSale,
+  listSales,
   importProducts,
   listImports,
   verifySession
@@ -222,6 +224,13 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/store/branch-stock' && req.method === 'POST') return json(res, 200, await adjustBranchStock(session, body))
     if (url.pathname === '/store/transfers' && req.method === 'GET') return json(res, 200, await listTransfers(session))
     if (url.pathname === '/store/transfers' && req.method === 'POST') return json(res, 200, await transferStock(session, body))
+
+    // Caja: ventas físicas en el local
+    if (url.pathname === '/store/sales' && req.method === 'GET') return json(res, 200, await listSales(session))
+    if (url.pathname === '/store/sales' && req.method === 'POST') {
+      const r = await createSale(session, body)
+      return json(res, r.error ? 400 : 200, r)
+    }
 
     // Finanzas (indicadores + datos persistentes)
     if (url.pathname === '/store/finance' && req.method === 'GET') return json(res, 200, await getFinance(session))

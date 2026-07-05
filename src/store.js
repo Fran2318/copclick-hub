@@ -411,6 +411,131 @@ export async function transferStock(session, body) {
   return { ok: true }
 }
 
+// ---------- Caja: ventas físicas en el local ----------
+// Afectan SOLO el stock físico de la sucursal; el stock online no se toca.
+const METODOS_CAJA = new Set(['efectivo', 'tarjeta', 'transferencia'])
+
+async function decBranchStock(clientId, branchId, productId, qty) {
+  const { data: cur } = await eco
+    .from('store_branch_stock')
+    .select('quantity')
+    .eq('branch_id', branchId)
+    .eq('product_id', productId)
+    .maybeSingle()
+  const nuevo = Math.max(0, (cur?.quantity ?? 0) - qty)
+  await eco.from('store_branch_stock').upsert(
+    {
+      client_id: clientId,
+      branch_id: branchId,
+      product_id: productId,
+      quantity: nuevo,
+      updated_at: new Date().toISOString(),
+      updated_by: 'caja'
+    },
+    { onConflict: 'branch_id,product_id' }
+  )
+}
+
+export async function createSale(session, body) {
+  const items = Array.isArray(body.items) ? body.items.slice(0, 100) : []
+  if (!items.length) return { error: 'la venta no tiene productos' }
+  const metodo = METODOS_CAJA.has(body.payment_method) ? body.payment_method : null
+  if (!metodo) return { error: 'método de pago inválido' }
+
+  let branch = null
+  if (body.branch_id) {
+    const { data } = await eco
+      .from('store_branches')
+      .select('id,name')
+      .eq('id', body.branch_id)
+      .eq('client_id', session.client_id)
+      .maybeSingle()
+    if (!data) return { error: 'sucursal inválida' }
+    branch = data
+  }
+
+  const clean = []
+  let total = 0
+  for (const it of items) {
+    const nombre = String(it.nombre || '').trim()
+    const qty = Math.round(Number(it.cantidad || 0))
+    const price = Number(it.precio || 0)
+    if (!nombre || qty <= 0 || price < 0) return { error: `ítem inválido: ${nombre || '(sin nombre)'}` }
+    clean.push({
+      product_id: it.product_id ? String(it.product_id) : null,
+      product_name: nombre,
+      quantity: qty,
+      unit_price: price,
+      subtotal: Math.round(qty * price * 100) / 100
+    })
+    total += qty * price
+  }
+  total = Math.round(total * 100) / 100
+  const pagado = metodo === 'efectivo' ? Number(body.monto_pagado || 0) : total
+  if (metodo === 'efectivo' && pagado < total) return { error: 'el monto pagado no cubre el total' }
+  const cambio = Math.round((pagado - total) * 100) / 100
+
+  const { count } = await eco
+    .from('store_sales')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', session.client_id)
+  const numero = 'F-' + String((count ?? 0) + 1).padStart(4, '0')
+
+  const { data: sale, error } = await eco
+    .from('store_sales')
+    .insert({
+      client_id: session.client_id,
+      sale_number: numero,
+      branch_id: branch?.id ?? null,
+      branch_name: branch?.name ?? null,
+      payment_method: metodo,
+      total,
+      monto_pagado: pagado,
+      cambio,
+      sold_by: session.name
+    })
+    .select('id')
+    .single()
+  if (error) return { error: error.message }
+
+  const { error: e2 } = await eco
+    .from('store_sale_items')
+    .insert(clean.map((c) => ({ ...c, sale_id: sale.id, client_id: session.client_id })))
+  if (e2) return { error: e2.message }
+
+  if (branch) {
+    for (const c of clean) {
+      if (c.product_id) await decBranchStock(session.client_id, branch.id, c.product_id, c.quantity)
+    }
+  }
+  logActivity(session, 'venta_fisica', `${numero} · Bs. ${total} (${metodo}${branch ? ' · ' + branch.name : ''})`)
+  return { ok: true, id: sale.id, numero, total, cambio }
+}
+
+export async function listSales(session) {
+  const { data: sales } = await eco
+    .from('store_sales')
+    .select('id,sale_number,branch_id,branch_name,payment_method,total,monto_pagado,cambio,sold_by,created_at')
+    .eq('client_id', session.client_id)
+    .order('created_at', { ascending: false })
+    .limit(100)
+  const ids = (sales ?? []).map((s) => s.id)
+  const items = []
+  for (let i = 0; i < ids.length; i += 100) {
+    const { data: chunk } = await eco
+      .from('store_sale_items')
+      .select('sale_id,product_name,quantity,unit_price,subtotal')
+      .in('sale_id', ids.slice(i, i + 100))
+    items.push(...(chunk ?? []))
+  }
+  const bySale = new Map()
+  for (const it of items) {
+    if (!bySale.has(it.sale_id)) bySale.set(it.sale_id, [])
+    bySale.get(it.sale_id).push(it)
+  }
+  return (sales ?? []).map((s) => ({ ...s, items: bySale.get(s.id) ?? [] }))
+}
+
 // ---------- Finanzas: datos del usuario (persistentes) + indicadores ----------
 const laPazMonth = (d) =>
   new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/La_Paz' }).slice(0, 7)
@@ -479,6 +604,23 @@ export async function getFinance(session) {
   const costMap = new Map((prods ?? []).map((p) => [String(p.id), Number(p.wholesale_price || 0)]))
   const orderMonth = new Map((orders ?? []).map((o) => [o.id, laPazMonth(o.created_at)]))
 
+  // Ventas físicas de Caja (viven en el ecosistema, no en la tienda)
+  const { data: fisSales } = await eco
+    .from('store_sales')
+    .select('id,total,created_at')
+    .eq('client_id', session.client_id)
+    .gte('created_at', desde.toISOString())
+  const fisIds = (fisSales ?? []).map((s) => s.id)
+  const fisItems = []
+  for (let i = 0; i < fisIds.length; i += 100) {
+    const { data: chunk } = await eco
+      .from('store_sale_items')
+      .select('sale_id,product_id,quantity')
+      .in('sale_id', fisIds.slice(i, i + 100))
+    fisItems.push(...(chunk ?? []))
+  }
+  const saleMonth = new Map((fisSales ?? []).map((s) => [s.id, laPazMonth(s.created_at)]))
+
   // Buckets mensuales: ingresos, COGS (costo de lo vendido), cobertura de costos
   const meses = new Map() // 'YYYY-MM' -> { ingresos, cogs }
   let qtyTotal = 0, qtyConCosto = 0
@@ -487,10 +629,26 @@ export async function getFinance(session) {
     if (!meses.has(m)) meses.set(m, { ingresos: 0, cogs: 0 })
     meses.get(m).ingresos += Number(o.total || 0)
   }
+  for (const s of fisSales ?? []) {
+    const m = laPazMonth(s.created_at)
+    if (!meses.has(m)) meses.set(m, { ingresos: 0, cogs: 0 })
+    meses.get(m).ingresos += Number(s.total || 0)
+  }
   for (const it of items) {
     const m = orderMonth.get(it.order_id)
     if (!m || !meses.has(m)) continue
     const cost = costMap.get(String(it.product_id)) ?? 0
+    const q = Number(it.quantity || 0)
+    qtyTotal += q
+    if (cost > 0) {
+      qtyConCosto += q
+      meses.get(m).cogs += cost * q
+    }
+  }
+  for (const it of fisItems) {
+    const m = saleMonth.get(it.sale_id)
+    if (!m || !meses.has(m)) continue
+    const cost = (it.product_id && costMap.get(String(it.product_id))) || 0
     const q = Number(it.quantity || 0)
     qtyTotal += q
     if (cost > 0) {
@@ -526,7 +684,7 @@ export async function getFinance(session) {
       ? Math.round(gastosMes / (margenBrutoPct / 100))
       : null
 
-  const nPedidos = (orders ?? []).length
+  const nPedidos = (orders ?? []).length + (fisSales ?? []).length
   const ticketPromedio = nPedidos > 0 ? Math.round(ingresosTot / nPedidos) : null
 
   // TIR y ROI: requieren inversión inicial + fecha
@@ -713,13 +871,16 @@ export async function storeDashboard(session) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
   const sevenAgo = new Date(); sevenAgo.setDate(sevenAgo.getDate() - 6); sevenAgo.setHours(0, 0, 0, 0)
 
-  const [prodRes, recentRes, weekRes, monthRes, prodCount, fisicoRes] = await Promise.all([
+  // Ventas físicas de Caja: se traen desde el rango más antiguo (mes o 7 días)
+  const desdeVentas = new Date(Math.min(new Date(monthStart).getTime(), sevenAgo.getTime())).toISOString()
+  const [prodRes, recentRes, weekRes, monthRes, prodCount, fisicoRes, cajaRes] = await Promise.all([
     db.from('products').select('name,stock,price,wholesale_price'),
     db.from('orders').select('order_number,customer_name,total,status,created_at').order('created_at', { ascending: false }).limit(6),
     db.from('orders').select('total,created_at').gte('created_at', sevenAgo.toISOString()),
     db.from('orders').select('total,payment_status,created_at').gte('created_at', monthStart),
     db.from('products').select('id', { count: 'exact', head: true }),
-    eco.from('store_branch_stock').select('quantity').eq('client_id', session.client_id)
+    eco.from('store_branch_stock').select('quantity').eq('client_id', session.client_id),
+    eco.from('store_sales').select('total,created_at').eq('client_id', session.client_id).gte('created_at', desdeVentas)
   ])
 
   const stockBajo = (prodRes.data ?? []).filter((p) => (p.stock ?? 0) < 5).map((p) => ({ nombre: p.name, stock: p.stock })).sort((a, b) => a.stock - b.stock).slice(0, 10)
@@ -728,17 +889,30 @@ export async function storeDashboard(session) {
   // Días calculados en hora de Bolivia (America/La_Paz), no UTC
   const laPazDay = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/La_Paz' })
   const today = laPazDay(Date.now())
+  const caja = cajaRes.data ?? []
   const hoy = (weekRes.data ?? []).filter((o) => laPazDay(o.created_at) === today)
-  const ventasHoy = hoy.reduce((a, o) => a + Number(o.total || 0), 0)
+  const cajaHoy = caja.filter((s) => laPazDay(s.created_at) === today)
+  const ventasHoy =
+    hoy.reduce((a, o) => a + Number(o.total || 0), 0) + cajaHoy.reduce((a, s) => a + Number(s.total || 0), 0)
 
   const mes = monthRes.data ?? []
-  const ingresosMes = mes.reduce((a, o) => a + Number(o.total || 0), 0)
-  const pagadoMes = mes.filter((o) => o.payment_status === 'paid').reduce((a, o) => a + Number(o.total || 0), 0)
+  const cajaMes = caja.filter((s) => new Date(s.created_at).getTime() >= new Date(monthStart).getTime())
+  const cajaMesTotal = cajaMes.reduce((a, s) => a + Number(s.total || 0), 0)
+  const ingresosMes = mes.reduce((a, o) => a + Number(o.total || 0), 0) + cajaMesTotal
+  // Las ventas de caja siempre están cobradas
+  const pagadoMes =
+    mes.filter((o) => o.payment_status === 'paid').reduce((a, o) => a + Number(o.total || 0), 0) + cajaMesTotal
 
   const tot = new Map(), cnt = new Map()
   for (const o of weekRes.data ?? []) {
     const d = laPazDay(o.created_at)
     tot.set(d, (tot.get(d) ?? 0) + Number(o.total || 0))
+    cnt.set(d, (cnt.get(d) ?? 0) + 1)
+  }
+  for (const s of caja) {
+    if (new Date(s.created_at).getTime() < sevenAgo.getTime()) continue
+    const d = laPazDay(s.created_at)
+    tot.set(d, (tot.get(d) ?? 0) + Number(s.total || 0))
     cnt.set(d, (cnt.get(d) ?? 0) + 1)
   }
   const ventas7 = []
@@ -774,7 +948,7 @@ export async function storeDashboard(session) {
   proyeccion7 = Math.round(proyeccion7)
 
   return {
-    ventasHoy, pedidosHoy: hoy.length, pedidosMes: mes.length, ingresosMes, pagadoMes,
+    ventasHoy, pedidosHoy: hoy.length + cajaHoy.length, pedidosMes: mes.length + cajaMes.length, ingresosMes, pagadoMes,
     totalProductos: prodCount.count ?? 0, stockBajo, ultimos, ventas7,
     stockOnlineTotal, stockFisicoTotal, margenPct, proyeccion7
   }
