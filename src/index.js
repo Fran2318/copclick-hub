@@ -17,8 +17,15 @@ import {
   setOrderStatus,
   deleteOrder,
   reprintOrder,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  adjustStock,
+  storeCustomers,
+  listActivity,
   verifySession
 } from './store.js'
+import { addStoreListener, removeStoreListener } from './events.js'
 
 function json(res, code, obj) {
   res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' })
@@ -125,6 +132,22 @@ const server = http.createServer(async (req, res) => {
     return json(res, 404, { error: 'not found' })
   }
 
+  // Eventos en vivo (SSE) — el token va por query porque EventSource no manda headers
+  if (url.pathname === '/store/events' && req.method === 'GET') {
+    const session = verifySession(url.searchParams.get('t') || '')
+    if (!session) return json(res, 401, { error: 'no autorizado' })
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'access-control-allow-origin': '*'
+    })
+    res.write(':conectado\n\n')
+    addStoreListener(session.client_id, res)
+    req.on('close', () => removeStoreListener(session.client_id, res))
+    return
+  }
+
   // ---------- Lado CLIENTE (tienda): login por código + usuarios + datos ----------
   if (url.pathname.startsWith('/store/')) {
     const body = req.method === 'POST' ? await readBody(req) : {}
@@ -151,9 +174,9 @@ const server = http.createServer(async (req, res) => {
       const r = await createUser(session, body.name, body.password, body.role)
       return json(res, r.error ? 400 : 200, r)
     }
-    if (url.pathname === '/store/dashboard') return json(res, 200, await storeDashboard(session))
-    if (url.pathname === '/store/orders') return json(res, 200, await storeOrders(session))
-    if (url.pathname === '/store/products') return json(res, 200, await storeProducts(session))
+    if (url.pathname === '/store/dashboard' && req.method === 'GET') return json(res, 200, await storeDashboard(session))
+    if (url.pathname === '/store/orders' && req.method === 'GET') return json(res, 200, await storeOrders(session))
+    if (url.pathname === '/store/products' && req.method === 'GET') return json(res, 200, await storeProducts(session))
 
     let sm = url.pathname.match(/^\/store\/orders\/([^/]+)$/)
     if (sm && req.method === 'GET') return json(res, 200, await getOrder(session, sm[1]))
@@ -163,6 +186,21 @@ const server = http.createServer(async (req, res) => {
     if (sm && req.method === 'POST') return json(res, 200, await deleteOrder(session, sm[1]))
     sm = url.pathname.match(/^\/store\/orders\/([^/]+)\/reprint$/)
     if (sm && req.method === 'POST') return json(res, 200, await reprintOrder(session, sm[1]))
+
+    // Productos
+    if (url.pathname === '/store/products' && req.method === 'POST')
+      return json(res, 200, await createProduct(session, body))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)$/)
+    if (sm && req.method === 'POST') return json(res, 200, await updateProduct(session, sm[1], body))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteProduct(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/stock$/)
+    if (sm && req.method === 'POST')
+      return json(res, 200, await adjustStock(session, sm[1], body.delta, body.motivo))
+
+    // Clientes + actividad
+    if (url.pathname === '/store/customers') return json(res, 200, await storeCustomers(session))
+    if (url.pathname === '/store/activity') return json(res, 200, await listActivity(session))
 
     return json(res, 404, { error: 'not found' })
   }

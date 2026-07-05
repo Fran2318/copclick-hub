@@ -195,6 +195,7 @@ export async function setOrderStatus(session, orderId, target) {
   if (target === 'delivered') u.delivered_at = now
   const { error } = await db.from('orders').update(u).eq('id', orderId)
   if (error) return { error: error.message }
+  logActivity(session, 'pedido_estado', `${orderId} → ${target}`)
   return { ok: true }
 }
 
@@ -204,7 +205,114 @@ export async function deleteOrder(session, orderId) {
   await db.from('order_items').delete().eq('order_id', orderId)
   const { error } = await db.from('orders').delete().eq('id', orderId)
   if (error) return { error: error.message }
+  logActivity(session, 'pedido_eliminado', orderId)
   return { ok: true }
+}
+
+// ---------- Log de actividad (quién, cuándo, qué) ----------
+export async function logActivity(session, action, detail) {
+  try {
+    await eco.from('store_activity').insert({
+      client_id: session.client_id,
+      user_name: session.name,
+      action,
+      detail: detail || null
+    })
+  } catch {
+    /* el log nunca debe romper la operación */
+  }
+}
+
+export async function listActivity(session) {
+  const { data } = await eco
+    .from('store_activity')
+    .select('id,user_name,action,detail,created_at')
+    .eq('client_id', session.client_id)
+    .order('created_at', { ascending: false })
+    .limit(60)
+  return data ?? []
+}
+
+// ---------- Productos (CRUD contra la tienda) ----------
+const PROD_FIELDS = ['name', 'description', 'price', 'stock', 'category', 'code', 'is_active']
+
+export async function createProduct(session, body) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  if (!body.name) return { error: 'falta el nombre' }
+  const row = {}
+  for (const f of PROD_FIELDS) if (body[f] !== undefined) row[f] = body[f]
+  row.is_active = row.is_active ?? true
+  const { data, error } = await db.from('products').insert(row).select('id').single()
+  if (error) return { error: error.message }
+  logActivity(session, 'producto_creado', body.name)
+  return { ok: true, id: data.id }
+}
+
+export async function updateProduct(session, productId, body) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const u = {}
+  for (const f of PROD_FIELDS) if (body[f] !== undefined) u[f] = body[f]
+  const { error } = await db.from('products').update(u).eq('id', productId)
+  if (error) return { error: error.message }
+  logActivity(session, 'producto_editado', body.name || productId)
+  return { ok: true }
+}
+
+export async function deleteProduct(session, productId) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  // Limpia dependencias con FK antes de borrar el producto
+  await db.from('product_images').delete().eq('product_id', productId)
+  await db.from('product_variants').delete().eq('product_id', productId)
+  await db.from('featured_products').delete().eq('product_id', productId)
+  const { error } = await db.from('products').delete().eq('id', productId)
+  if (error) return { error: error.message }
+  logActivity(session, 'producto_eliminado', productId)
+  return { ok: true }
+}
+
+export async function adjustStock(session, productId, delta, motivo) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const { data: cur, error: e1 } = await db.from('products').select('name,stock').eq('id', productId).single()
+  if (e1) return { error: e1.message }
+  const nuevo = Math.max(0, (cur.stock ?? 0) + Number(delta || 0))
+  const { error } = await db.from('products').update({ stock: nuevo }).eq('id', productId)
+  if (error) return { error: error.message }
+  logActivity(session, 'stock_ajustado', `${cur.name}: ${cur.stock} → ${nuevo}${motivo ? ` (${motivo})` : ''}`)
+  return { ok: true, stock: nuevo }
+}
+
+// ---------- Clientes (derivados de los pedidos de la tienda) ----------
+export async function storeCustomers(session) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return []
+  const { data } = await db
+    .from('orders')
+    .select('customer_name,customer_email,customer_phone,total,created_at')
+    .order('created_at', { ascending: false })
+    .limit(1000)
+  const map = new Map()
+  for (const o of data ?? []) {
+    const key = (o.customer_phone || o.customer_email || o.customer_name || '').trim().toLowerCase()
+    if (!key) continue
+    if (!map.has(key)) {
+      map.set(key, {
+        nombre: o.customer_name,
+        email: o.customer_email,
+        telefono: o.customer_phone,
+        compras: 0,
+        total: 0,
+        ultima: o.created_at
+      })
+    }
+    const c = map.get(key)
+    c.compras += 1
+    c.total += Number(o.total || 0)
+  }
+  return [...map.values()].sort((a, b) => b.compras - a.compras)
 }
 
 export async function reprintOrder(session, orderId) {
@@ -231,7 +339,7 @@ export async function storeProducts(session) {
   if (!db) return []
   const { data } = await db
     .from('products')
-    .select('id,name,code,price,stock,category')
+    .select('id,name,code,price,stock,category,description,is_active')
     .order('name')
   return (data ?? []).map((p) => ({
     id: p.id,
@@ -239,7 +347,9 @@ export async function storeProducts(session) {
     sku: p.code,
     precio: Number(p.price || 0),
     stock: p.stock,
-    categoria: p.category
+    categoria: p.category,
+    descripcion: p.description,
+    activo: p.is_active
   }))
 }
 
@@ -262,8 +372,10 @@ export async function storeDashboard(session) {
   const stockBajo = (prodRes.data ?? []).filter((p) => (p.stock ?? 0) < 5).map((p) => ({ nombre: p.name, stock: p.stock })).sort((a, b) => a.stock - b.stock).slice(0, 10)
   const ultimos = (recentRes.data ?? []).map((o) => ({ numero: o.order_number, cliente: o.customer_name, total: Number(o.total || 0), estado: o.status, creado_en: o.created_at }))
 
-  const today = new Date().toISOString().slice(0, 10)
-  const hoy = (weekRes.data ?? []).filter((o) => (o.created_at || '').slice(0, 10) === today)
+  // Días calculados en hora de Bolivia (America/La_Paz), no UTC
+  const laPazDay = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/La_Paz' })
+  const today = laPazDay(Date.now())
+  const hoy = (weekRes.data ?? []).filter((o) => laPazDay(o.created_at) === today)
   const ventasHoy = hoy.reduce((a, o) => a + Number(o.total || 0), 0)
 
   const mes = monthRes.data ?? []
@@ -272,14 +384,13 @@ export async function storeDashboard(session) {
 
   const tot = new Map(), cnt = new Map()
   for (const o of weekRes.data ?? []) {
-    const d = (o.created_at || '').slice(0, 10)
+    const d = laPazDay(o.created_at)
     tot.set(d, (tot.get(d) ?? 0) + Number(o.total || 0))
     cnt.set(d, (cnt.get(d) ?? 0) + 1)
   }
   const ventas7 = []
   for (let i = 6; i >= 0; i--) {
-    const dt = new Date(); dt.setDate(dt.getDate() - i)
-    const d = dt.toISOString().slice(0, 10)
+    const d = laPazDay(Date.now() - i * 86400000)
     ventas7.push({ dia: d.slice(5), total: tot.get(d) ?? 0, cantidad: cnt.get(d) ?? 0 })
   }
 

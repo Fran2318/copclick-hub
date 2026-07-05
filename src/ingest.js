@@ -1,6 +1,7 @@
 import { eco, storeClient } from './supabase.js'
 import { emitNewOrder } from './hub.js'
 import { buildOrderPayload } from './payload.js'
+import { notifyStore } from './events.js'
 
 let channels = [] // { ch, store }
 
@@ -32,6 +33,13 @@ async function subscribeClient(c) {
         const items = await fetchItems(store, order.id)
         const data = buildOrderPayload(order, items, c)
         const res = await emitNewOrder(c.id, data)
+        // Aviso en vivo a COPCLICK Core (pop-up + sonido en la vista de tienda)
+        notifyStore(c.id, {
+          type: 'new_order',
+          numero: order.order_number,
+          cliente: order.customer_name,
+          total: Number(order.total || 0)
+        })
         console.log(`[ingest] ${c.name}: ${order.order_number} → ${res}`)
       } catch (e) {
         console.error('[ingest] error procesando pedido:', e.message)
