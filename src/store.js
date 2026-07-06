@@ -99,10 +99,79 @@ export async function login(code, name, password) {
 export async function listUsers(session) {
   const { data } = await eco
     .from('store_users')
-    .select('id,name,role,created_at')
+    .select('id,name,role,avatar,created_at')
     .eq('client_id', session.client_id)
     .order('created_at')
   return data ?? []
+}
+
+// Lista pública (solo con el código de acceso): para la pantalla de perfiles
+export async function publicUsers(code) {
+  const c = await clientByCode(code)
+  if (!c) return { error: 'Código de acceso inválido' }
+  if (c.status === 'blocked') return { error: 'Esta tienda está bloqueada' }
+  const { data } = await eco
+    .from('store_users')
+    .select('id,name,role,avatar')
+    .eq('client_id', c.id)
+    .order('created_at')
+  return { users: data ?? [] }
+}
+
+export async function updateUser(session, userId, body) {
+  const self = session.user_id === userId
+  if (!self && session.role !== 'admin') return { error: 'Sin permiso' }
+  const u = {}
+  if (body.avatar !== undefined) {
+    if (body.avatar && String(body.avatar).length > 200000) return { error: 'foto de perfil muy pesada' }
+    u.avatar = body.avatar || null
+  }
+  if (body.password) u.password_hash = hashPassword(body.password)
+  if (session.role === 'admin') {
+    if (body.name) u.name = String(body.name).trim()
+    if (body.role) u.role = body.role === 'admin' ? 'admin' : 'user'
+  }
+  if (!Object.keys(u).length) return { error: 'nada que cambiar' }
+  // Nunca dejar la tienda sin admin
+  if (u.role === 'user') {
+    const { data: cur } = await eco.from('store_users').select('role').eq('id', userId).single()
+    if (cur?.role === 'admin') {
+      const { count } = await eco
+        .from('store_users')
+        .select('id', { count: 'exact', head: true })
+        .eq('client_id', session.client_id)
+        .eq('role', 'admin')
+      if ((count ?? 0) <= 1) return { error: 'No podés quitar el único admin' }
+    }
+  }
+  const { error } = await eco.from('store_users').update(u).eq('id', userId).eq('client_id', session.client_id)
+  if (error) return { error: error.message.includes('duplicate') ? 'Ya existe un usuario con ese nombre' : error.message }
+  logActivity(session, 'usuario_editado', u.name || userId)
+  return { ok: true }
+}
+
+export async function deleteUser(session, userId) {
+  if (session.role !== 'admin') return { error: 'Solo el admin puede eliminar usuarios' }
+  if (session.user_id === userId) return { error: 'No podés eliminar tu propio usuario' }
+  const { data: u } = await eco
+    .from('store_users')
+    .select('name,role')
+    .eq('id', userId)
+    .eq('client_id', session.client_id)
+    .single()
+  if (!u) return { error: 'usuario no encontrado' }
+  if (u.role === 'admin') {
+    const { count } = await eco
+      .from('store_users')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', session.client_id)
+      .eq('role', 'admin')
+    if ((count ?? 0) <= 1) return { error: 'No podés eliminar el único admin' }
+  }
+  const { error } = await eco.from('store_users').delete().eq('id', userId).eq('client_id', session.client_id)
+  if (error) return { error: error.message }
+  logActivity(session, 'usuario_eliminado', u.name)
+  return { ok: true }
 }
 
 export async function createUser(session, name, password, role) {
@@ -245,6 +314,21 @@ export async function listActivity(session) {
 // ---------- Productos (CRUD contra la tienda) ----------
 const PROD_FIELDS = ['name', 'description', 'price', 'stock', 'category', 'code', 'is_active', 'wholesale_price']
 
+// Alcance del producto (online / sucursal / ambas) — vive en el ecosistema,
+// porque el esquema de la tienda no se puede tocar.
+async function saveScope(session, productId, alcance, sucursalId) {
+  if (!alcance || !['online', 'sucursal', 'ambas'].includes(alcance)) return
+  await eco.from('store_product_meta').upsert(
+    {
+      client_id: session.client_id,
+      product_id: String(productId),
+      scope: alcance,
+      branch_id: alcance === 'sucursal' ? sucursalId || null : null
+    },
+    { onConflict: 'client_id,product_id' }
+  )
+}
+
 export async function createProduct(session, body) {
   const db = await storeDbFor(session.client_id)
   if (!db) return { error: 'tienda no configurada' }
@@ -252,8 +336,11 @@ export async function createProduct(session, body) {
   const row = {}
   for (const f of PROD_FIELDS) if (body[f] !== undefined) row[f] = body[f]
   row.is_active = row.is_active ?? true
+  // Producto solo de sucursal: nunca visible en la web
+  if (body.alcance === 'sucursal') row.is_active = false
   const { data, error } = await db.from('products').insert(row).select('id').single()
   if (error) return { error: error.message }
+  await saveScope(session, data.id, body.alcance, body.sucursal_id)
   logActivity(session, 'producto_creado', body.name)
   return { ok: true, id: data.id }
 }
@@ -263,8 +350,12 @@ export async function updateProduct(session, productId, body) {
   if (!db) return { error: 'tienda no configurada' }
   const u = {}
   for (const f of PROD_FIELDS) if (body[f] !== undefined) u[f] = body[f]
-  const { error } = await db.from('products').update(u).eq('id', productId)
-  if (error) return { error: error.message }
+  if (body.alcance === 'sucursal') u.is_active = false
+  if (Object.keys(u).length) {
+    const { error } = await db.from('products').update(u).eq('id', productId)
+    if (error) return { error: error.message }
+  }
+  await saveScope(session, productId, body.alcance, body.sucursal_id)
   logActivity(session, 'producto_editado', body.name || productId)
   return { ok: true }
 }
@@ -278,6 +369,7 @@ export async function deleteProduct(session, productId) {
   await db.from('featured_products').delete().eq('product_id', productId)
   const { error } = await db.from('products').delete().eq('id', productId)
   if (error) return { error: error.message }
+  await eco.from('store_product_meta').delete().eq('client_id', session.client_id).eq('product_id', String(productId))
   logActivity(session, 'producto_eliminado', productId)
   return { ok: true }
 }
@@ -441,11 +533,11 @@ export async function deleteBranch(session, branchId) {
   return { ok: true }
 }
 
-// ---------- Stock físico por sucursal ----------
+// ---------- Stock físico por sucursal (y por variante: variant_key = "talla|color") ----------
 export async function getBranchStock(session) {
   const { data } = await eco
     .from('store_branch_stock')
-    .select('branch_id,product_id,quantity')
+    .select('branch_id,product_id,variant_key,quantity')
     .eq('client_id', session.client_id)
   return data ?? []
 }
@@ -453,27 +545,35 @@ export async function getBranchStock(session) {
 export async function adjustBranchStock(session, body) {
   const { branch_id, product_id, delta, nombre } = body
   if (!branch_id || !product_id) return { error: 'faltan datos' }
+  const vk = body.variant_key ? String(body.variant_key) : ''
   const { data: cur } = await eco
     .from('store_branch_stock')
     .select('id,quantity')
     .eq('branch_id', branch_id)
     .eq('product_id', product_id)
+    .eq('variant_key', vk)
     .maybeSingle()
   const prev = cur?.quantity ?? 0
-  const nuevo = Math.max(0, prev + Number(delta || 0))
+  // "set" pone un valor exacto; "delta" suma o resta
+  const nuevo =
+    body.set !== undefined && body.set !== null
+      ? Math.max(0, Math.round(Number(body.set) || 0))
+      : Math.max(0, prev + Number(delta || 0))
   const { error } = await eco.from('store_branch_stock').upsert(
     {
       client_id: session.client_id,
       branch_id,
       product_id,
+      variant_key: vk,
       quantity: nuevo,
       updated_at: new Date().toISOString(),
       updated_by: session.name
     },
-    { onConflict: 'branch_id,product_id' }
+    { onConflict: 'branch_id,product_id,variant_key' }
   )
   if (error) return { error: error.message }
-  logActivity(session, 'stock_fisico', `${nombre || product_id}: ${prev} → ${nuevo}`)
+  const etiqueta = vk ? `${nombre || product_id} (${vk.replace('|', ' · ')})` : nombre || product_id
+  logActivity(session, 'stock_fisico', `${etiqueta}: ${prev} → ${nuevo}`)
   return { ok: true, quantity: nuevo }
 }
 
@@ -481,7 +581,7 @@ export async function adjustBranchStock(session, body) {
 export async function listTransfers(session) {
   const { data } = await eco
     .from('store_transfers')
-    .select('id,product_name,from_branch_id,to_branch_id,quantity,transferred_by,transferred_at')
+    .select('id,product_name,variant_key,from_branch_id,to_branch_id,quantity,transferred_by,transferred_at')
     .eq('client_id', session.client_id)
     .order('transferred_at', { ascending: false })
     .limit(30)
@@ -491,6 +591,7 @@ export async function listTransfers(session) {
 export async function transferStock(session, body) {
   const { product_id, nombre, from_branch_id, to_branch_id, quantity } = body
   const qty = Number(quantity || 0)
+  const vk = body.variant_key ? String(body.variant_key) : ''
   if (!product_id || !from_branch_id || !to_branch_id || qty <= 0) return { error: 'datos incompletos' }
   if (from_branch_id === to_branch_id) return { error: 'origen y destino son la misma sucursal' }
 
@@ -499,25 +600,27 @@ export async function transferStock(session, body) {
     .select('quantity')
     .eq('branch_id', from_branch_id)
     .eq('product_id', product_id)
+    .eq('variant_key', vk)
     .maybeSingle()
   const disp = origen?.quantity ?? 0
   if (qty > disp) return { error: `stock insuficiente en origen (hay ${disp})` }
 
-  const r1 = await adjustBranchStock(session, { branch_id: from_branch_id, product_id, delta: -qty, nombre })
+  const r1 = await adjustBranchStock(session, { branch_id: from_branch_id, product_id, variant_key: vk, delta: -qty, nombre })
   if (r1.error) return r1
-  const r2 = await adjustBranchStock(session, { branch_id: to_branch_id, product_id, delta: qty, nombre })
+  const r2 = await adjustBranchStock(session, { branch_id: to_branch_id, product_id, variant_key: vk, delta: qty, nombre })
   if (r2.error) return r2
 
   await eco.from('store_transfers').insert({
     client_id: session.client_id,
     product_id,
     product_name: nombre || null,
+    variant_key: vk || null,
     from_branch_id,
     to_branch_id,
     quantity: qty,
     transferred_by: session.name
   })
-  logActivity(session, 'transferencia', `${nombre || product_id} ×${qty}`)
+  logActivity(session, 'transferencia', `${nombre || product_id}${vk ? ` (${vk.replace('|', ' · ')})` : ''} ×${qty}`)
   return { ok: true }
 }
 
@@ -525,12 +628,13 @@ export async function transferStock(session, body) {
 // Afectan SOLO el stock físico de la sucursal; el stock online no se toca.
 const METODOS_CAJA = new Set(['efectivo', 'tarjeta', 'transferencia'])
 
-async function decBranchStock(clientId, branchId, productId, qty) {
+async function decBranchStock(clientId, branchId, productId, qty, vk = '') {
   const { data: cur } = await eco
     .from('store_branch_stock')
     .select('quantity')
     .eq('branch_id', branchId)
     .eq('product_id', productId)
+    .eq('variant_key', vk)
     .maybeSingle()
   const nuevo = Math.max(0, (cur?.quantity ?? 0) - qty)
   await eco.from('store_branch_stock').upsert(
@@ -538,11 +642,12 @@ async function decBranchStock(clientId, branchId, productId, qty) {
       client_id: clientId,
       branch_id: branchId,
       product_id: productId,
+      variant_key: vk,
       quantity: nuevo,
       updated_at: new Date().toISOString(),
       updated_by: 'caja'
     },
-    { onConflict: 'branch_id,product_id' }
+    { onConflict: 'branch_id,product_id,variant_key' }
   )
 }
 
@@ -617,7 +722,9 @@ export async function createSale(session, body) {
 
   if (branch) {
     for (const c of clean) {
-      if (c.product_id) await decBranchStock(session.client_id, branch.id, c.product_id, c.quantity)
+      if (!c.product_id) continue
+      const vk = [c.size, c.color].filter(Boolean).join('|')
+      await decBranchStock(session.client_id, branch.id, c.product_id, c.quantity, vk)
     }
   }
   logActivity(session, 'venta_fisica', `${numero} · Bs. ${total} (${metodo}${branch ? ' · ' + branch.name : ''})`)
@@ -958,7 +1065,7 @@ export async function reprintOrder(session, orderId) {
 export async function storeProducts(session) {
   const db = await storeDbFor(session.client_id)
   if (!db) return []
-  const [{ data }, { data: vars }] = await Promise.all([
+  const [{ data }, { data: vars }, { data: metas }] = await Promise.all([
     db
       .from('products')
       .select('id,name,code,price,stock,category,description,is_active,wholesale_price,images')
@@ -966,8 +1073,10 @@ export async function storeProducts(session) {
     db
       .from('product_variants')
       .select('id,product_id,sku,size,color,color_code,stock,price_adjustment,is_active')
-      .order('id')
+      .order('id'),
+    eco.from('store_product_meta').select('product_id,scope,branch_id').eq('client_id', session.client_id)
   ])
+  const metaMap = new Map((metas ?? []).map((m) => [String(m.product_id), m]))
   const varMap = new Map()
   for (const v of vars ?? []) {
     const k = String(v.product_id)
@@ -992,7 +1101,9 @@ export async function storeProducts(session) {
     activo: p.is_active,
     imagen: thumb(p.images),
     imagenes: Array.isArray(p.images) ? p.images : [],
-    variantes: varMap.get(String(p.id)) ?? []
+    variantes: varMap.get(String(p.id)) ?? [],
+    alcance: metaMap.get(String(p.id))?.scope ?? 'ambas',
+    sucursal_id: metaMap.get(String(p.id))?.branch_id ?? null
   }))
 }
 

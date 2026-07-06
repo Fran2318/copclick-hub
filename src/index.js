@@ -10,6 +10,9 @@ import {
   login,
   listUsers,
   createUser,
+  publicUsers,
+  updateUser,
+  deleteUser,
   storeOrders,
   storeProducts,
   storeDashboard,
@@ -182,6 +185,11 @@ const server = http.createServer(async (req, res) => {
       const r = await login(body.code, body.name, body.password)
       return json(res, r.error ? 401 : 200, r)
     }
+    // Perfiles para la pantalla de inicio (requiere el código de acceso)
+    if (url.pathname === '/store/users-public' && req.method === 'POST') {
+      const r = await publicUsers(body.code)
+      return json(res, r.error ? 400 : 200, r)
+    }
 
     // Con sesión (Bearer token)
     const session = verifySession((req.headers['authorization'] || '').replace(/^Bearer /, ''))
@@ -192,6 +200,10 @@ const server = http.createServer(async (req, res) => {
       const r = await createUser(session, body.name, body.password, body.role)
       return json(res, r.error ? 400 : 200, r)
     }
+    let um = url.pathname.match(/^\/store\/users\/([^/]+)\/delete$/)
+    if (um && req.method === 'POST') return json(res, 200, await deleteUser(session, um[1]))
+    um = url.pathname.match(/^\/store\/users\/([^/]+)$/)
+    if (um && req.method === 'POST') return json(res, 200, await updateUser(session, um[1], body))
     if (url.pathname === '/store/dashboard' && req.method === 'GET') return json(res, 200, await storeDashboard(session))
     if (url.pathname === '/store/orders' && req.method === 'GET') return json(res, 200, await storeOrders(session))
     if (url.pathname === '/store/products' && req.method === 'GET') return json(res, 200, await storeProducts(session))
