@@ -857,8 +857,14 @@ export async function storeProducts(session) {
   if (!db) return []
   const { data } = await db
     .from('products')
-    .select('id,name,code,price,stock,category,description,is_active,wholesale_price')
+    .select('id,name,code,price,stock,category,description,is_active,wholesale_price,images')
     .order('name')
+  // La primera imagen del producto (si hay) como miniatura para la Caja
+  const thumb = (imgs) => {
+    if (!Array.isArray(imgs) || !imgs.length) return null
+    const f = imgs[0]
+    return typeof f === 'string' ? f : f?.url || f?.image_url || null
+  }
   return (data ?? []).map((p) => ({
     id: p.id,
     nombre: p.name,
@@ -868,7 +874,8 @@ export async function storeProducts(session) {
     stock: p.stock,
     categoria: p.category,
     descripcion: p.description,
-    activo: p.is_active
+    activo: p.is_active,
+    imagen: thumb(p.images)
   }))
 }
 
