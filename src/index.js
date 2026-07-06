@@ -34,6 +34,11 @@ import {
   saveFinance,
   createSale,
   listSales,
+  saveVariant,
+  deleteVariant,
+  addProductImage,
+  deleteProductImage,
+  setMainImage,
   importProducts,
   listImports,
   verifySession
@@ -203,6 +208,18 @@ const server = http.createServer(async (req, res) => {
     // Productos
     if (url.pathname === '/store/products' && req.method === 'POST')
       return json(res, 200, await createProduct(session, body))
+
+    // Variantes (tallas / colores) y fotos
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/variants$/)
+    if (sm && req.method === 'POST') return json(res, 200, await saveVariant(session, sm[1], body))
+    sm = url.pathname.match(/^\/store\/variants\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteVariant(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/image$/)
+    if (sm && req.method === 'POST') return json(res, 200, await addProductImage(session, sm[1], body))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/image\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteProductImage(session, sm[1], body.url))
+    sm = url.pathname.match(/^\/store\/products\/([^/]+)\/image\/main$/)
+    if (sm && req.method === 'POST') return json(res, 200, await setMainImage(session, sm[1], body.url))
     sm = url.pathname.match(/^\/store\/products\/([^/]+)$/)
     if (sm && req.method === 'POST') return json(res, 200, await updateProduct(session, sm[1], body))
     sm = url.pathname.match(/^\/store\/products\/([^/]+)\/delete$/)

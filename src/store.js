@@ -294,6 +294,107 @@ export async function adjustStock(session, productId, delta, motivo) {
   return { ok: true, stock: nuevo }
 }
 
+// ---------- Variantes (tallas y colores, en el Supabase de la tienda) ----------
+const VAR_FIELDS = ['sku', 'size', 'color', 'color_code', 'stock', 'price_adjustment', 'is_active']
+
+export async function saveVariant(session, productId, body) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const row = {}
+  for (const f of VAR_FIELDS) if (body[f] !== undefined) row[f] = body[f]
+  if (body.id) {
+    const { error } = await db.from('product_variants').update(row).eq('id', body.id).eq('product_id', productId)
+    if (error) return { error: error.message }
+    logActivity(session, 'variante_editada', `${body.size || ''} ${body.color || ''}`.trim() || String(body.id))
+    return { ok: true, id: body.id }
+  }
+  if (!row.size && !row.color) return { error: 'poné al menos talla o color' }
+  row.is_active = row.is_active ?? true
+  const { data, error } = await db
+    .from('product_variants')
+    .insert({ ...row, product_id: productId })
+    .select('id')
+    .single()
+  if (error) return { error: error.message }
+  logActivity(session, 'variante_creada', `${row.size || ''} ${row.color || ''}`.trim())
+  return { ok: true, id: data.id }
+}
+
+export async function deleteVariant(session, variantId) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const { error } = await db.from('product_variants').delete().eq('id', variantId)
+  if (error) return { error: error.message }
+  logActivity(session, 'variante_eliminada', String(variantId))
+  return { ok: true }
+}
+
+// ---------- Fotos de producto (Storage de la tienda, bucket "products") ----------
+const imgPathFromUrl = (url) => {
+  const m = String(url).match(/\/object\/public\/products\/(.+)$/)
+  return m ? decodeURIComponent(m[1]) : null
+}
+
+async function getImages(db, productId) {
+  const { data } = await db.from('products').select('images,name').eq('id', productId).single()
+  return { imgs: Array.isArray(data?.images) ? data.images : [], name: data?.name }
+}
+
+export async function addProductImage(session, productId, body) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const m = String(body.data || '').match(/^data:(image\/[a-z+.-]+);base64,(.+)$/i)
+  if (!m) return { error: 'imagen inválida' }
+  const buf = Buffer.from(m[2], 'base64')
+  if (buf.length > 4 * 1024 * 1024) return { error: 'imagen muy pesada (máx. 4 MB)' }
+  const ext = (m[1].split('/')[1] || 'png').replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')
+  const path = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}.${ext}`
+  const { error: eUp } = await db.storage.from('products').upload(path, buf, { contentType: m[1] })
+  if (eUp) return { error: eUp.message }
+  const url = db.storage.from('products').getPublicUrl(path).data.publicUrl
+
+  const { imgs, name } = await getImages(db, productId)
+  const nuevas = [...imgs, url]
+  const { error } = await db.from('products').update({ images: nuevas }).eq('id', productId)
+  if (error) return { error: error.message }
+  // Mantener product_images en sincronía (la web de la tienda también la usa)
+  await db.from('product_images').insert({
+    product_id: productId,
+    image_url: url,
+    is_main: nuevas.length === 1,
+    display_order: nuevas.length - 1
+  })
+  logActivity(session, 'foto_agregada', name || productId)
+  return { ok: true, url, imagenes: nuevas }
+}
+
+export async function deleteProductImage(session, productId, url) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const { imgs, name } = await getImages(db, productId)
+  const nuevas = imgs.filter((u) => u !== url)
+  const { error } = await db.from('products').update({ images: nuevas }).eq('id', productId)
+  if (error) return { error: error.message }
+  await db.from('product_images').delete().eq('product_id', productId).eq('image_url', url)
+  const path = imgPathFromUrl(url)
+  if (path) await db.storage.from('products').remove([path])
+  logActivity(session, 'foto_eliminada', name || productId)
+  return { ok: true, imagenes: nuevas }
+}
+
+export async function setMainImage(session, productId, url) {
+  const db = await storeDbFor(session.client_id)
+  if (!db) return { error: 'tienda no configurada' }
+  const { imgs } = await getImages(db, productId)
+  if (!imgs.includes(url)) return { error: 'esa foto no es del producto' }
+  const nuevas = [url, ...imgs.filter((u) => u !== url)]
+  const { error } = await db.from('products').update({ images: nuevas }).eq('id', productId)
+  if (error) return { error: error.message }
+  await db.from('product_images').update({ is_main: false }).eq('product_id', productId)
+  await db.from('product_images').update({ is_main: true }).eq('product_id', productId).eq('image_url', url)
+  return { ok: true, imagenes: nuevas }
+}
+
 // ---------- Sucursales (viven en el Supabase del ecosistema, por client_id) ----------
 export async function listBranches(session) {
   const { data } = await eco
@@ -475,7 +576,9 @@ export async function createSale(session, body) {
       product_name: nombre,
       quantity: qty,
       unit_price: price,
-      subtotal: Math.round(qty * price * 100) / 100
+      subtotal: Math.round(qty * price * 100) / 100,
+      size: it.size ? String(it.size) : null,
+      color: it.color ? String(it.color) : null
     })
     total += qty * price
   }
@@ -533,7 +636,7 @@ export async function listSales(session) {
   for (let i = 0; i < ids.length; i += 100) {
     const { data: chunk } = await eco
       .from('store_sale_items')
-      .select('sale_id,product_name,quantity,unit_price,subtotal')
+      .select('sale_id,product_name,quantity,unit_price,subtotal,size,color')
       .in('sale_id', ids.slice(i, i + 100))
     items.push(...(chunk ?? []))
   }
@@ -855,10 +958,22 @@ export async function reprintOrder(session, orderId) {
 export async function storeProducts(session) {
   const db = await storeDbFor(session.client_id)
   if (!db) return []
-  const { data } = await db
-    .from('products')
-    .select('id,name,code,price,stock,category,description,is_active,wholesale_price,images')
-    .order('name')
+  const [{ data }, { data: vars }] = await Promise.all([
+    db
+      .from('products')
+      .select('id,name,code,price,stock,category,description,is_active,wholesale_price,images')
+      .order('name'),
+    db
+      .from('product_variants')
+      .select('id,product_id,sku,size,color,color_code,stock,price_adjustment,is_active')
+      .order('id')
+  ])
+  const varMap = new Map()
+  for (const v of vars ?? []) {
+    const k = String(v.product_id)
+    if (!varMap.has(k)) varMap.set(k, [])
+    varMap.get(k).push(v)
+  }
   // La primera imagen del producto (si hay) como miniatura para la Caja
   const thumb = (imgs) => {
     if (!Array.isArray(imgs) || !imgs.length) return null
@@ -875,7 +990,9 @@ export async function storeProducts(session) {
     categoria: p.category,
     descripcion: p.description,
     activo: p.is_active,
-    imagen: thumb(p.images)
+    imagen: thumb(p.images),
+    imagenes: Array.isArray(p.images) ? p.images : [],
+    variantes: varMap.get(String(p.id)) ?? []
   }))
 }
 
