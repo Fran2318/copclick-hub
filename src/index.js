@@ -44,6 +44,13 @@ import {
   setMainImage,
   importProducts,
   listImports,
+  listTables,
+  saveTable,
+  deleteTable,
+  listRows,
+  insertRows,
+  updateRow,
+  deleteRow,
   verifySession
 } from './store.js'
 import { addStoreListener, removeStoreListener } from './events.js'
@@ -268,6 +275,19 @@ const server = http.createServer(async (req, res) => {
     // Importación de base de datos
     if (url.pathname === '/store/import' && req.method === 'POST') return json(res, 200, await importProducts(session, body))
     if (url.pathname === '/store/imports' && req.method === 'GET') return json(res, 200, await listImports(session))
+
+    // Base de datos personalizada (tablas propias)
+    if (url.pathname === '/store/tables' && req.method === 'GET') return json(res, 200, await listTables(session))
+    if (url.pathname === '/store/tables' && req.method === 'POST') return json(res, 200, await saveTable(session, body))
+    sm = url.pathname.match(/^\/store\/tables\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteTable(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/tables\/([^/]+)\/rows$/)
+    if (sm && req.method === 'GET') return json(res, 200, await listRows(session, sm[1]))
+    if (sm && req.method === 'POST') return json(res, 200, await insertRows(session, sm[1], body))
+    sm = url.pathname.match(/^\/store\/rows\/([^/]+)\/delete$/)
+    if (sm && req.method === 'POST') return json(res, 200, await deleteRow(session, sm[1]))
+    sm = url.pathname.match(/^\/store\/rows\/([^/]+)$/)
+    if (sm && req.method === 'POST') return json(res, 200, await updateRow(session, sm[1], body))
 
     return json(res, 404, { error: 'not found' })
   }

@@ -1013,6 +1013,163 @@ export async function listImports(session) {
   return data ?? []
 }
 
+// ---------- Base de datos personalizada (tablas propias del usuario) ----------
+const MAX_ROWS_TABLE = 5000
+const COL_TYPES = ['text', 'number', 'date', 'boolean', 'currency', 'email', 'phone', 'url']
+
+function cleanColumns(cols) {
+  if (!Array.isArray(cols)) return []
+  return cols.slice(0, 40).map((c, i) => ({
+    key: String(c.key || 'c' + i).slice(0, 40),
+    name: String(c.name || 'Columna ' + (i + 1)).slice(0, 60),
+    type: COL_TYPES.includes(c.type) ? c.type : 'text',
+    required: !!c.required,
+    unique: !!c.unique
+  }))
+}
+
+export async function listTables(session) {
+  const { data } = await eco
+    .from('store_custom_tables')
+    .select('id,name,description,columns,created_by,created_at')
+    .eq('client_id', session.client_id)
+    .order('created_at')
+  const tables = data ?? []
+  for (const t of tables) {
+    const { count } = await eco
+      .from('store_custom_rows')
+      .select('id', { count: 'exact', head: true })
+      .eq('table_id', t.id)
+    t.rows = count ?? 0
+  }
+  return tables
+}
+
+export async function saveTable(session, body) {
+  const name = String(body.name || '').trim()
+  if (!name) return { error: 'falta el nombre de la tabla' }
+  const columns = cleanColumns(body.columns)
+  if (!columns.length) return { error: 'agregá al menos una columna' }
+  const row = { name, description: body.description || null, columns }
+  if (body.id) {
+    const { error } = await eco
+      .from('store_custom_tables')
+      .update(row)
+      .eq('id', body.id)
+      .eq('client_id', session.client_id)
+    if (error) return { error: error.message }
+    logActivity(session, 'tabla_editada', name)
+    return { ok: true, id: body.id }
+  }
+  const { data, error } = await eco
+    .from('store_custom_tables')
+    .insert({ ...row, client_id: session.client_id, created_by: session.name })
+    .select('id')
+    .single()
+  if (error) return { error: error.message }
+  logActivity(session, 'tabla_creada', name)
+  return { ok: true, id: data.id }
+}
+
+export async function deleteTable(session, tableId) {
+  const { error } = await eco
+    .from('store_custom_tables')
+    .delete()
+    .eq('id', tableId)
+    .eq('client_id', session.client_id)
+  if (error) return { error: error.message }
+  logActivity(session, 'tabla_eliminada', tableId)
+  return { ok: true }
+}
+
+async function tableFor(session, tableId) {
+  const { data } = await eco
+    .from('store_custom_tables')
+    .select('id,columns')
+    .eq('id', tableId)
+    .eq('client_id', session.client_id)
+    .maybeSingle()
+  return data
+}
+
+async function violaUnicos(tableId, columns, data, excludeId) {
+  for (const c of columns) {
+    if (!c.unique) continue
+    const v = data?.[c.key]
+    if (v === undefined || v === null || v === '') continue
+    let q = eco
+      .from('store_custom_rows')
+      .select('id', { count: 'exact', head: true })
+      .eq('table_id', tableId)
+      .eq('data->>' + c.key, String(v))
+    if (excludeId) q = q.neq('id', excludeId)
+    const { count } = await q
+    if ((count ?? 0) > 0) return `"${c.name}" debe ser único: ya existe "${v}"`
+  }
+  return null
+}
+
+export async function listRows(session, tableId) {
+  const t = await tableFor(session, tableId)
+  if (!t) return { error: 'tabla no encontrada' }
+  const { data } = await eco
+    .from('store_custom_rows')
+    .select('id,data,created_at,updated_at')
+    .eq('table_id', tableId)
+    .order('created_at')
+    .limit(MAX_ROWS_TABLE)
+  return data ?? []
+}
+
+export async function insertRows(session, tableId, body) {
+  const t = await tableFor(session, tableId)
+  if (!t) return { error: 'tabla no encontrada' }
+  const rows = Array.isArray(body.rows) ? body.rows.slice(0, 2000) : body.data ? [body.data] : []
+  if (!rows.length) return { error: 'sin datos' }
+  const { count } = await eco
+    .from('store_custom_rows')
+    .select('id', { count: 'exact', head: true })
+    .eq('table_id', tableId)
+  if ((count ?? 0) + rows.length > MAX_ROWS_TABLE) return { error: `máximo ${MAX_ROWS_TABLE} filas por tabla` }
+  if (rows.length === 1) {
+    const err = await violaUnicos(tableId, t.columns ?? [], rows[0], null)
+    if (err) return { error: err }
+  }
+  let ok = 0
+  for (let i = 0; i < rows.length; i += 200) {
+    const chunk = rows.slice(i, i + 200).map((d) => ({ table_id: tableId, client_id: session.client_id, data: d || {} }))
+    const { error } = await eco.from('store_custom_rows').insert(chunk)
+    if (error) return { error: error.message, inserted: ok }
+    ok += chunk.length
+  }
+  return { ok: true, inserted: ok }
+}
+
+export async function updateRow(session, rowId, body) {
+  const { data: r } = await eco
+    .from('store_custom_rows')
+    .select('table_id')
+    .eq('id', rowId)
+    .eq('client_id', session.client_id)
+    .maybeSingle()
+  if (!r) return { error: 'registro no encontrado' }
+  const t = await tableFor(session, r.table_id)
+  const err = await violaUnicos(r.table_id, t?.columns ?? [], body.data ?? {}, rowId)
+  if (err) return { error: err }
+  const { error } = await eco
+    .from('store_custom_rows')
+    .update({ data: body.data ?? {}, updated_at: new Date().toISOString() })
+    .eq('id', rowId)
+  if (error) return { error: error.message }
+  return { ok: true }
+}
+
+export async function deleteRow(session, rowId) {
+  const { error } = await eco.from('store_custom_rows').delete().eq('id', rowId).eq('client_id', session.client_id)
+  if (error) return { error: error.message }
+  return { ok: true }
+}
+
 // ---------- Clientes (derivados de los pedidos de la tienda) ----------
 export async function storeCustomers(session) {
   const db = await storeDbFor(session.client_id)
