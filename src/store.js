@@ -626,7 +626,7 @@ export async function transferStock(session, body) {
 
 // ---------- Caja: ventas físicas en el local ----------
 // Afectan SOLO el stock físico de la sucursal; el stock online no se toca.
-const METODOS_CAJA = new Set(['efectivo', 'tarjeta', 'transferencia'])
+const METODOS_CAJA = new Set(['efectivo', 'tarjeta', 'qr', 'transferencia'])
 
 async function decBranchStock(clientId, branchId, productId, qty, vk = '') {
   const { data: cur } = await eco
